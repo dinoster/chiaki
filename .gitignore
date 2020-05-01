@@ -20,3 +20,4 @@ chiaki.rb
 *.jks
 secret.tar
 keystore-env.sh
+chiaki.conf
