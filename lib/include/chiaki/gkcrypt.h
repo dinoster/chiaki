@@ -25,6 +25,17 @@
 #include <stdlib.h>
 #include <stdint.h>
 
+#if defined(__SWITCH__) || defined(CHIAKI_LIB_ENABLE_MBEDTLS)
+#include "mbedtls/aes.h"
+#include "mbedtls/md.h"
+#include "mbedtls/gcm.h"
+#include "mbedtls/sha256.h"
+#else
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
+#include <openssl/sha.h>
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -54,6 +65,18 @@ typedef struct chiaki_gkcrypt_t {
 	uint8_t key_gmac_base[CHIAKI_GKCRYPT_BLOCK_SIZE];
 	uint8_t key_gmac_current[CHIAKI_GKCRYPT_BLOCK_SIZE];
 	uint64_t key_gmac_index_current;
+#if defined(__SWITCH__) || defined(CHIAKI_LIB_ENABLE_MBEDTLS)
+	// HMAC
+	mbedtls_md_context_t md_ctx;
+	// AES ECB
+	mbedtls_aes_context aes_ctx;
+	mbedtls_gcm_context gcm_ctx;
+#else
+	// AES ECB
+	EVP_CIPHER_CTX * aes_ctx;
+	// GCM
+	EVP_CIPHER_CTX * gcm_ctx;
+#endif
 	ChiakiLog *log;
 } ChiakiGKCrypt;
 

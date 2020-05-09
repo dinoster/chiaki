@@ -21,19 +21,7 @@
 #include <string.h>
 #include <assert.h>
 
-#if defined(__SWITCH__) || defined(CHIAKI_LIB_ENABLE_MBEDTLS)
-#include "mbedtls/aes.h"
-#include "mbedtls/md.h"
-#include "mbedtls/gcm.h"
-#include "mbedtls/sha256.h"
-#else
-#include <openssl/evp.h>
-#include <openssl/hmac.h>
-#include <openssl/sha.h>
-#endif
-
 #include "utils.h"
-
 
 #define KEY_BUF_CHUNK_SIZE 0x1000
 
@@ -76,6 +64,43 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_gkcrypt_init(ChiakiGKCrypt *gkcrypt, Chiaki
 	{
 		gkcrypt->key_buf = NULL;
 	}
+
+#if defined(__SWITCH__) || defined(CHIAKI_LIB_ENABLE_MBEDTLS)
+	mbedtls_md_init(&gkcrypt->md_ctx);
+	mbedtls_aes_init(&gkcrypt->aes_ctx);
+	// build mbedtls gcm context AES_128_GCM
+	// Encryption
+	mbedtls_gcm_init(&gkcrypt->gcm_ctx);
+
+	if(mbedtls_md_setup(&gkcrypt->md_ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256) , 1) != 0)
+	{
+		mbedtls_md_free(&gkcrypt->md_ctx);
+        mbedtls_aes_free(&gkcrypt->aes_ctx);
+        mbedtls_gcm_free(&gkcrypt->gcm_ctx);
+		return CHIAKI_ERR_UNKNOWN;
+	}
+#else
+	gkcrypt->aes_ctx = EVP_CIPHER_CTX_new();
+	if(!gkcrypt->aes_ctx)
+		return CHIAKI_ERR_UNKNOWN;
+
+	gkcrypt->gcm_ctx = EVP_CIPHER_CTX_new();
+	if(!gkcrypt->gcm_ctx)
+		return CHIAKI_ERR_MEMORY;
+
+	if(!EVP_EncryptInit_ex(gkcrypt->aes_ctx, EVP_aes_128_ecb(), NULL, gkcrypt->key_base, NULL))
+	{
+		EVP_CIPHER_CTX_free(gkcrypt->aes_ctx);
+		return CHIAKI_ERR_UNKNOWN;
+	}
+
+	if(!EVP_CIPHER_CTX_set_padding(gkcrypt->aes_ctx, 0))
+	{
+		EVP_CIPHER_CTX_free(gkcrypt->aes_ctx);
+		return CHIAKI_ERR_UNKNOWN;
+	}
+#endif
+
 	err = gkcrypt_gen_key_iv(gkcrypt, index, handshake_key, ecdh_secret);
 	if(err != CHIAKI_ERR_SUCCESS)
 	{
@@ -87,6 +112,25 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_gkcrypt_init(ChiakiGKCrypt *gkcrypt, Chiaki
 	gkcrypt->key_gmac_index_current = 0;
 	memcpy(gkcrypt->key_gmac_current, gkcrypt->key_gmac_base, sizeof(gkcrypt->key_gmac_current));
 
+#if defined(__SWITCH__) || defined(CHIAKI_LIB_ENABLE_MBEDTLS)
+	// build mbedtls aes context
+	if(mbedtls_aes_setkey_enc(&gkcrypt->aes_ctx, gkcrypt->key_base, 128) != 0)
+	{
+		return CHIAKI_ERR_UNKNOWN;
+	}
+#else
+	if(!EVP_EncryptInit_ex(gkcrypt->aes_ctx, EVP_aes_128_ecb(), NULL, gkcrypt->key_base, NULL))
+	{
+		EVP_CIPHER_CTX_free(gkcrypt->aes_ctx);
+		return CHIAKI_ERR_UNKNOWN;
+	}
+
+	if(!EVP_CIPHER_CTX_set_padding(gkcrypt->aes_ctx, 0))
+	{
+		EVP_CIPHER_CTX_free(gkcrypt->aes_ctx);
+		return CHIAKI_ERR_UNKNOWN;
+	}
+#endif
 	if(gkcrypt->key_buf)
 	{
 		err = chiaki_thread_create(&gkcrypt->key_buf_thread, gkcrypt_thread_func, gkcrypt);
@@ -122,6 +166,15 @@ CHIAKI_EXPORT void chiaki_gkcrypt_fini(ChiakiGKCrypt *gkcrypt)
 		chiaki_cond_fini(&gkcrypt->key_buf_cond);
 		chiaki_mutex_fini(&gkcrypt->key_buf_mutex);
 		chiaki_aligned_free(gkcrypt->key_buf);
+#if defined(__SWITCH__) || defined(CHIAKI_LIB_ENABLE_MBEDTLS)
+		mbedtls_md_free(&gkcrypt->md_ctx);
+		mbedtls_aes_free(&gkcrypt->aes_ctx);
+		mbedtls_gcm_free(&gkcrypt->gcm_ctx);
+#else
+		EVP_CIPHER_CTX_free(gkcrypt->aes_ctx);
+		EVP_CIPHER_CTX_free(gkcrypt->gcm_ctx);
+#endif
+
 	}
 }
 
@@ -138,37 +191,20 @@ static ChiakiErrorCode gkcrypt_gen_key_iv(ChiakiGKCrypt *gkcrypt, uint8_t index,
 
 	uint8_t hmac[CHIAKI_GKCRYPT_BLOCK_SIZE*2];
 	size_t hmac_size = sizeof(hmac);
-	#if defined(__SWITCH__) || defined(CHIAKI_LIB_ENABLE_MBEDTLS)
-	mbedtls_md_context_t ctx;
-	mbedtls_md_init(&ctx);
+#if defined(__SWITCH__) || defined(CHIAKI_LIB_ENABLE_MBEDTLS)
 
-	if(mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256) , 1) != 0){
-		mbedtls_md_free(&ctx);
+	if(mbedtls_md_hmac_starts(&gkcrypt->md_ctx, ecdh_secret, CHIAKI_ECDH_SECRET_SIZE) != 0)
 		return CHIAKI_ERR_UNKNOWN;
-	}
 
-	if(mbedtls_md_hmac_starts(&ctx, ecdh_secret, CHIAKI_ECDH_SECRET_SIZE) != 0){
-		mbedtls_md_free(&ctx);
+	if(mbedtls_md_hmac_update(&gkcrypt->md_ctx, data, sizeof(data)) != 0)
 		return CHIAKI_ERR_UNKNOWN;
-	}
 
-	if(mbedtls_md_hmac_update(&ctx, data, sizeof(data)) != 0){
-		mbedtls_md_free(&ctx);
+	if(mbedtls_md_hmac_finish(&gkcrypt->md_ctx, hmac) != 0)
 		return CHIAKI_ERR_UNKNOWN;
-	}
-
-	if(mbedtls_md_hmac_finish(&ctx, hmac) != 0){
-		mbedtls_md_free(&ctx);
-		return CHIAKI_ERR_UNKNOWN;
-	}
-
-	mbedtls_md_free(&ctx);
-
-	#else
+#else
 	if(!HMAC(EVP_sha256(), ecdh_secret, CHIAKI_ECDH_SECRET_SIZE, data, sizeof(data), hmac, (unsigned int *)&hmac_size))
 		return CHIAKI_ERR_UNKNOWN;
-
-	#endif
+#endif
 	assert(hmac_size == sizeof(hmac));
 
 	memcpy(gkcrypt->key_base, hmac, CHIAKI_GKCRYPT_BLOCK_SIZE);
@@ -225,63 +261,33 @@ CHIAKI_EXPORT void chiaki_gkcrypt_gen_tmp_gmac_key(ChiakiGKCrypt *gkcrypt, uint6
 		memcpy(key_out, gkcrypt->key_gmac_base, sizeof(gkcrypt->key_gmac_base));
 }
 
-CHIAKI_EXPORT ChiakiErrorCode chiaki_gkcrypt_gen_key_stream(ChiakiGKCrypt *gkcrypt, size_t key_pos, uint8_t *buf, size_t buf_size)
+
+CHIAKI_EXPORT ChiakiErrorCode inline chiaki_gkcrypt_gen_key_stream(ChiakiGKCrypt *gkcrypt, size_t key_pos, uint8_t *buf, size_t buf_size)
 {
 	assert(key_pos % CHIAKI_GKCRYPT_BLOCK_SIZE == 0);
 	assert(buf_size % CHIAKI_GKCRYPT_BLOCK_SIZE == 0);
 
-#if defined(__SWITCH__) || defined(CHIAKI_LIB_ENABLE_MBEDTLS)
-	// build mbedtls aes context
-	mbedtls_aes_context ctx;
-	mbedtls_aes_init(&ctx);
-
-	if(mbedtls_aes_setkey_enc(&ctx, gkcrypt->key_base, 128) != 0){
-		mbedtls_aes_free(&ctx);
-		return CHIAKI_ERR_UNKNOWN;
-	}
-
-#else
-	EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-	if(!ctx)
-		return CHIAKI_ERR_UNKNOWN;
-
-	if(!EVP_EncryptInit_ex(ctx, EVP_aes_128_ecb(), NULL, gkcrypt->key_base, NULL))
-	{
-		EVP_CIPHER_CTX_free(ctx);
-		return CHIAKI_ERR_UNKNOWN;
-	}
-
-	if(!EVP_CIPHER_CTX_set_padding(ctx, 0))
-	{
-		EVP_CIPHER_CTX_free(ctx);
-		return CHIAKI_ERR_UNKNOWN;
-	}
-#endif
 	int counter_offset = (int)(key_pos / CHIAKI_GKCRYPT_BLOCK_SIZE);
 
 	for(uint8_t *cur = buf, *end = buf + buf_size; cur < end; cur += CHIAKI_GKCRYPT_BLOCK_SIZE)
 		counter_add(cur, gkcrypt->iv, counter_offset++);
 
 #if defined(__SWITCH__) || defined(CHIAKI_LIB_ENABLE_MBEDTLS)
-	for(int i=0; i<buf_size; i=i+16){
+	for(int i=0; i<buf_size; i=i+16)
+	{
 		// loop over all blocks of 16 bytes (128 bits)
-		if(mbedtls_aes_crypt_ecb(&ctx, MBEDTLS_AES_ENCRYPT, buf+i, buf+i) != 0){
-			mbedtls_aes_free(&ctx);
+		if(mbedtls_aes_crypt_ecb(&gkcrypt->aes_ctx, MBEDTLS_AES_ENCRYPT, buf+i, buf+i) != 0){
 			return CHIAKI_ERR_UNKNOWN;
 		}
 	}
-
-	mbedtls_aes_free(&ctx);
 #else
 	int outl;
-	EVP_EncryptUpdate(ctx, buf, &outl, buf, (int)buf_size);
+	EVP_EncryptUpdate(gkcrypt->aes_ctx, buf, &outl, buf, (int)buf_size);
 	if(outl != buf_size)
 	{
-		EVP_CIPHER_CTX_free(ctx);
 		return CHIAKI_ERR_UNKNOWN;
 	}
 
-	EVP_CIPHER_CTX_free(ctx);
 #endif
 	return CHIAKI_ERR_SUCCESS;
 }
@@ -291,7 +297,7 @@ static bool gkcrypt_key_buf_should_generate(ChiakiGKCrypt *gkcrypt)
 	return gkcrypt->last_key_pos > gkcrypt->key_buf_key_pos_min + gkcrypt->key_buf_populated / 2;
 }
 
-CHIAKI_EXPORT ChiakiErrorCode chiaki_gkcrypt_get_key_stream(ChiakiGKCrypt *gkcrypt, size_t key_pos, uint8_t *buf, size_t buf_size)
+CHIAKI_EXPORT ChiakiErrorCode inline chiaki_gkcrypt_get_key_stream(ChiakiGKCrypt *gkcrypt, size_t key_pos, uint8_t *buf, size_t buf_size)
 {
 	if(!gkcrypt->key_buf)
 		return chiaki_gkcrypt_gen_key_stream(gkcrypt, key_pos, buf, buf_size);
@@ -338,19 +344,20 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_gkcrypt_decrypt(ChiakiGKCrypt *gkcrypt, siz
 	size_t padding_pre = key_pos % CHIAKI_GKCRYPT_BLOCK_SIZE;
 	size_t full_size = ((padding_pre + buf_size + CHIAKI_GKCRYPT_BLOCK_SIZE - 1) / CHIAKI_GKCRYPT_BLOCK_SIZE) * CHIAKI_GKCRYPT_BLOCK_SIZE;
 
-	uint8_t *key_stream = malloc(full_size);
-	if(!key_stream)
-		return CHIAKI_ERR_MEMORY;
+	//uint8_t *key_stream = malloc(full_size);
+	uint8_t key_stream[full_size];
+	//if(!key_stream)
+	//	return CHIAKI_ERR_MEMORY;
 
 	ChiakiErrorCode err = chiaki_gkcrypt_get_key_stream(gkcrypt, key_pos - padding_pre, key_stream, full_size);
 	if(err != CHIAKI_ERR_SUCCESS)
 	{
-		free(key_stream);
+		//free(key_stream);
 		return err;
 	}
 
 	xor_bytes(buf, key_stream + padding_pre, buf_size);
-	free(key_stream);
+	//free(key_stream);
 
 	return CHIAKI_ERR_SUCCESS;
 }
@@ -377,86 +384,58 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_gkcrypt_gmac(ChiakiGKCrypt *gkcrypt, size_t
 #if defined(__SWITCH__) || defined(CHIAKI_LIB_ENABLE_MBEDTLS)
 	// build mbedtls gcm context AES_128_GCM
 	// Encryption
-	mbedtls_gcm_context actx;
-	mbedtls_gcm_init(&actx);
 	// set gmac_key 128 bits key
-	if(mbedtls_gcm_setkey(&actx, MBEDTLS_CIPHER_ID_AES, gmac_key, CHIAKI_GKCRYPT_BLOCK_SIZE*8) != 0){
-		mbedtls_gcm_free(&actx);
+	if(mbedtls_gcm_setkey(&gkcrypt->gcm_ctx, MBEDTLS_CIPHER_ID_AES, gmac_key, CHIAKI_GKCRYPT_BLOCK_SIZE*8) != 0){
 		return CHIAKI_ERR_UNKNOWN;
 	}
 
 	// encrypt without additional data
-	if(mbedtls_gcm_starts(&actx, MBEDTLS_GCM_ENCRYPT, iv, CHIAKI_GKCRYPT_BLOCK_SIZE, NULL, 0) != 0){
-		mbedtls_gcm_free(&actx);
+	if(mbedtls_gcm_starts(&gkcrypt->gcm_ctx, MBEDTLS_GCM_ENCRYPT, iv, CHIAKI_GKCRYPT_BLOCK_SIZE, NULL, 0) != 0){
 		return CHIAKI_ERR_UNKNOWN;
 	}
 	// set "additional data" only whitout input nor output
 	// to get the same result as:
 	// EVP_EncryptUpdate(ctx, NULL, &len, buf, (int)buf_size)
-	if(mbedtls_gcm_crypt_and_tag(&actx, MBEDTLS_GCM_ENCRYPT,
+	if(mbedtls_gcm_crypt_and_tag(&gkcrypt->gcm_ctx, MBEDTLS_GCM_ENCRYPT,
 		0, iv, CHIAKI_GKCRYPT_BLOCK_SIZE,
 		buf, buf_size, NULL, NULL,
 		CHIAKI_GKCRYPT_GMAC_SIZE, gmac_out) != 0){
-
-		mbedtls_gcm_free(&actx);
 		return CHIAKI_ERR_UNKNOWN;
 	}
 
-	mbedtls_gcm_free(&actx);
-
-	return CHIAKI_ERR_SUCCESS;
 #else
-	ChiakiErrorCode ret = CHIAKI_ERR_SUCCESS;
-
-	EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-	if(!ctx)
+	if(!EVP_CipherInit_ex(gkcrypt->gcm_ctx, EVP_aes_128_gcm(), NULL, NULL, NULL, 1))
 	{
-		ret = CHIAKI_ERR_MEMORY;
-		goto fail;
+		return CHIAKI_ERR_UNKNOWN;
 	}
 
-	if(!EVP_CipherInit_ex(ctx, EVP_aes_128_gcm(), NULL, NULL, NULL, 1))
+	if(!EVP_CIPHER_CTX_ctrl(gkcrypt->gcm_ctx, EVP_CTRL_GCM_SET_IVLEN, CHIAKI_GKCRYPT_BLOCK_SIZE, NULL))
 	{
-		ret = CHIAKI_ERR_UNKNOWN;
-		goto fail_cipher;
+		return CHIAKI_ERR_UNKNOWN;
 	}
 
-	if(!EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, CHIAKI_GKCRYPT_BLOCK_SIZE, NULL))
+	if(!EVP_CipherInit_ex(gkcrypt->gcm_ctx, NULL, NULL, gmac_key, iv, 1))
 	{
-		ret = CHIAKI_ERR_UNKNOWN;
-		goto fail_cipher;
-	}
-
-	if(!EVP_CipherInit_ex(ctx, NULL, NULL, gmac_key, iv, 1))
-	{
-		ret = CHIAKI_ERR_UNKNOWN;
-		goto fail_cipher;
+		return CHIAKI_ERR_UNKNOWN;
 	}
 
 	int len;
-	if(!EVP_EncryptUpdate(ctx, NULL, &len, buf, (int)buf_size))
+	if(!EVP_EncryptUpdate(gkcrypt->gcm_ctx, NULL, &len, buf, (int)buf_size))
 	{
-		ret = CHIAKI_ERR_UNKNOWN;
-		goto fail_cipher;
+		return CHIAKI_ERR_UNKNOWN;
 	}
 
-	if(!EVP_EncryptFinal_ex(ctx, NULL, &len))
+	if(!EVP_EncryptFinal_ex(gkcrypt->gcm_ctx, NULL, &len))
 	{
-		ret = CHIAKI_ERR_UNKNOWN;
-		goto fail_cipher;
+		return CHIAKI_ERR_UNKNOWN;
 	}
 
-	if(!EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, CHIAKI_GKCRYPT_GMAC_SIZE, gmac_out))
+	if(!EVP_CIPHER_CTX_ctrl(gkcrypt->gcm_ctx, EVP_CTRL_GCM_GET_TAG, CHIAKI_GKCRYPT_GMAC_SIZE, gmac_out))
 	{
-		ret = CHIAKI_ERR_UNKNOWN;
-		goto fail_cipher;
+		return CHIAKI_ERR_UNKNOWN;
 	}
-
-fail_cipher:
-	EVP_CIPHER_CTX_free(ctx);
-fail:
-	return ret;
 #endif
+	return CHIAKI_ERR_SUCCESS;
 }
 
 static bool key_buf_mutex_pred(void *user)

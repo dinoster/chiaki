@@ -17,7 +17,7 @@ endfunction()
 
 # allow gcc -g to use 
 # aarch64-none-elf-addr2line -e build_switch/switch/chiaki -f -p -C -a 0xCCB5C
-set(CMAKE_BUILD_TYPE Debug)
+#set(CMAKE_BUILD_TYPE Debug)
 
 set( TOOL_OS_SUFFIX "" )
 if( CMAKE_HOST_WIN32 )
@@ -39,7 +39,7 @@ set(CMAKE_RANLIB       "${DEVKITPRO}/devkitA64/bin/aarch64-none-elf-ranlib${TOOL
 # custom /opt/devkitpro/switchvars.sh
 switchvar(PORTLIBS_PREFIX PORTLIBS_PREFIX "${DEVKITPRO}/portlibs/switch")
 switchvar(ARCH ARCH "-march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIC -ftls-model=local-exec")
-switchvar(CMAKE_C_FLAGS CFLAGS "${ARCH} -O2 -ffunction-sections -fdata-sections")
+switchvar(CMAKE_C_FLAGS CFLAGS "${ARCH} -O3 -ffunction-sections -fdata-sections")
 switchvar(CMAKE_CXX_FLAGS CXXFLAGS "${CMAKE_C_FLAGS}")
 switchvar(CMAKE_CPP_FLAGS CPPFLAGS "-D__SWITCH__ -I${PORTLIBS_PREFIX}/include -isystem${DEVKITPRO}/libnx/include")
 switchvar(CMAKE_LD_FLAGS LDFLAGS "${ARCH} -L${PORTLIBS_PREFIX}/lib -L${DEVKITPRO}/libnx/lib")
